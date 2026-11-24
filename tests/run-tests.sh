@@ -153,45 +153,101 @@ printf 'junk\000\000{\\"network\\": \\"tcp\\", \\"security\\": \\"reality\\", \\
 ok "Xray 配置：取到两个 target" eq "$(extract_targets "$WORK/xray.json" | tr '\t\n' '=;')" "xray=www.cf-site.example:443;xray=127.0.0.1:8001;"
 ok "sing-box 配置：取到 handshake.server" eq "$(extract_targets "$WORK/sb.json" | tr '\t\n' '=;')" "singbox=www.apple.com;"
 ok "3x-ui 数据库（转义 JSON）：取到 dest" eq "$(extract_targets "$WORK/x-ui.db" | tr '\t\n' '=;')" "xray=yahoo.com:443;"
-CHECK_BAD=0; check_one xray "104.16.1.1:443" >/dev/null
-ok "check_one：CF IP 记为危险" eq "$CHECK_BAD" 1
-CHECK_BAD=0; check_one xray "[2606:4700::1]:443" >/dev/null
-ok "check_one：CF IPv6 记为危险" eq "$CHECK_BAD" 1
-CHECK_BAD=0; check_one xray "127.0.0.1:8001" >/dev/null
-ok "check_one：本机回落不算危险" eq "$CHECK_BAD" 0
+check_one "104.16.1.1:443"
+ok "check_one：CF IP 记为危险" eq "$CK_LEVEL" bad
+check_one "[2606:4700::1]:443"
+ok "check_one：CF IPv6 记为危险" eq "$CK_LEVEL" bad
+check_one "127.0.0.1:8001"
+ok "check_one：本机回落不算危险" eq "$CK_LEVEL" ok
+# x-ui.db 是二进制文件：UTF-8 环境下 awk 不能报 Invalid multibyte data（真机上就报过）
+printf 'SQLite format 3\000\377\376\344\270{\\"realitySettings\\": {\\"dest\\": \\"yahoo.com:443\\"}}\344\270 \377' > "$WORK/bin.db"
+u8=$(locale -a 2>/dev/null | grep -iE '^(C|en_US)\.utf-?8$' | head -n 1)
+if [[ -n $u8 ]]; then
+  r=$(LC_ALL=$u8 extract_targets "$WORK/bin.db" 2> "$WORK/bin.err" | tr '\t\n' '=;')
+  ok "二进制数据库（UTF-8 环境）：照样取到 dest，没有 awk 警告" bash -c '[[ $1 == "xray=yahoo.com:443;" && ! -s $2 ]]' _ "$r" "$WORK/bin.err"
+else
+  echo "skip - 本机没有 UTF-8 locale，跳过二进制数据库的 awk 警告测试"
+fi
 
 echo "## 体检：微软、苹果、Cloudflare 的域名"
 printf '%s\n' "www.microsoft.com 23.40.1.1" "itunes.apple.com 17.253.1.1" "notmicrosoft.com 93.184.216.34" \
   "microsoft.com.evil.net 93.184.216.35" "www.cloudflare.com 104.16.123.96" "plain.example 93.184.216.36" >> "$FAKE_DNS"
-cw() { CHECK_BAD=0 CHECK_WARN=0; check_one xray "$1" > "$WORK/cw.out"; echo "$CHECK_BAD/$CHECK_WARN"; }
-ok "微软域名：建议更换（记为注意，不算危险）" eq "$(cw www.microsoft.com:443)" "0/1"
-ok "微软域名：输出写明“建议更换”和是谁的域名" bash -c 'grep -q "\[建议更换\] Xray target = www.microsoft.com:443 → 23.40.1.1" "$1" && grep -q "这是微软的域名" "$1"' _ "$WORK/cw.out"
-ok "苹果域名（itunes.apple.com）：建议更换" eq "$(cw itunes.apple.com)" "0/1"
-ok "大写、末尾带点的苹果域名也认得" eq "$(cw WWW.Apple.Com.)" "0/1"
-r=$(cw www.bing.com)
-ok "解析不到 IP 的微软域名：仍然建议更换，不是“未知”" bash -c '[[ $2 == 0/1 ]] && grep -q "建议更换" "$1" && ! grep -q "\[未知\]" "$1"' _ "$WORK/cw.out" "$r"
-ok "notmicrosoft.com 不算微软" eq "$(cw notmicrosoft.com)" "0/0"
-ok "microsoft.com.evil.net 不算微软" eq "$(cw microsoft.com.evil.net)" "0/0"
-r=$(cw www.cloudflare.com)
-ok "Cloudflare 域名解析到 CF 网段：危险" bash -c '[[ $2 == 1/0 ]] && grep -q "属于 Cloudflare 网段" "$1"' _ "$WORK/cw.out" "$r"
-r=$(cw dash.cloudflare.com)
-ok "解析不到 IP 的 Cloudflare 域名：仍然危险" bash -c '[[ $2 == 1/0 ]] && grep -q "这是 Cloudflare 的域名" "$1"' _ "$WORK/cw.out" "$r"
-r=$(cw plain.example)
-ok "普通域名：正常" bash -c '[[ $2 == 0/0 ]] && grep -q "\[正常\]" "$1"' _ "$WORK/cw.out" "$r"
-r=$( cdn_by_headers() { echo Akamai; }; cw www.microsoft.com )
-ok "微软域名、响应头也像 CDN：一并说明，只记一次" bash -c '[[ $2 == 0/1 ]] && grep -q "响应头像是 Akamai 的 CDN" "$1"' _ "$WORK/cw.out" "$r"
+cw() { check_one "$1"; echo "$CK_LEVEL|$CK_WHY"; }   # 级别|理由
+ok "微软域名：有风险，说明是微软的网站" bash -c '[[ $1 == "risk|微软的网站："* ]]' _ "$(cw www.microsoft.com:443)"
+ok "苹果域名（itunes.apple.com）：有风险" bash -c '[[ $1 == "risk|苹果的网站："* ]]' _ "$(cw itunes.apple.com)"
+ok "大写、末尾带点的苹果域名也认得" bash -c '[[ $1 == risk\|* ]]' _ "$(cw WWW.Apple.Com.)"
+ok "解析不到 IP 的微软域名：仍然有风险，不是“没法判断”" bash -c '[[ $1 == risk\|* ]]' _ "$(cw www.bing.com)"
+ok "notmicrosoft.com 不算微软" bash -c '[[ $1 == ok\|* ]]' _ "$(cw notmicrosoft.com)"
+ok "microsoft.com.evil.net 不算微软" bash -c '[[ $1 == ok\|* ]]' _ "$(cw microsoft.com.evil.net)"
+ok "Cloudflare 域名解析到 CF 网段：危险，按网段说明" bash -c '[[ $1 == "bad|走 Cloudflare（解析到的 IP 在 Cloudflare 的网段里）" ]]' _ "$(cw www.cloudflare.com)"
+ok "解析不到 IP 的 Cloudflare 域名：仍然危险" bash -c '[[ $1 == "bad|Cloudflare 自己的网站"* ]]' _ "$(cw dash.cloudflare.com)"
+ok "普通域名：没问题" eq "$(cw plain.example)" "ok|没走 Cloudflare，也没看出走别的 CDN"
+ok "微软域名、看起来也走 CDN：一并说明" bash -c '[[ $1 == risk\|*"看起来还走 CDN（Akamai）" ]]' _ "$(cdn_by_headers() { echo Akamai; }; cw www.microsoft.com)"
+ok "普通域名看起来走 CDN：有风险，用“看起来”" eq "$(cdn_by_headers() { echo "亚马逊 CloudFront"; }; cw plain.example)" "risk|看起来走 CDN（亚马逊 CloudFront）"
+ok "从 VPS 访问不了网站时：没法判断，不算“没发现问题”" bash -c '[[ $1 == "unknown|没走 Cloudflare，但从这台 VPS 用 HTTPS 访问不了它"* ]]' _ "$(cdn_by_headers() { return 1; }; cw plain.example)"
+ok "没装 curl 时：不怪网站，说明没查别的 CDN" eq "$(cdn_by_headers() { return 2; }; cw plain.example)" "ok|没走 Cloudflare；本机没装 curl，是不是走别的 CDN 没查"
 echo "myvm.eastus.cloudapp.azure.com 20.1.2.3" >> "$FAKE_DNS"
-ok "用户自己的 Azure 主机名不算微软" eq "$(cw myvm.eastus.cloudapp.azure.com)" "0/0"
-r=$(cw foo.workers.dev)
-ok "解析不到的 workers.dev 子域名：只是“未知”，不按品牌判" bash -c '[[ $2 == 0/1 ]] && grep -q "\[未知\]" "$1"' _ "$WORK/cw.out" "$r"
+ok "用户自己的 Azure 主机名不算微软" bash -c '[[ $1 == ok\|* ]]' _ "$(cw myvm.eastus.cloudapp.azure.com)"
+ok "解析不到的 workers.dev 子域名：没法判断，不按品牌判" bash -c '[[ $1 == unknown\|* ]]' _ "$(cw foo.workers.dev)"
+
+echo "## 体检报告：去重、先给结论、默认不列 IP"
 out=$(cmd_check --domain plain.example 2>&1); rc=$?
-ok "check：没问题时说“没有发现问题”，退出码 0" bash -c '[[ $1 == 0 ]] && grep -q "没有发现问题" <<< "$2"' _ "$rc" "$out"
+ok "check：没问题时结论写“没发现问题”，退出码 0" bash -c '[[ $1 == 0 ]] && grep -q "^结论：没发现问题。" <<< "$2" && ! grep -q "怎么办" <<< "$2" && ! grep -q "没查成" <<< "$2"' _ "$rc" "$out"
+out=$(cdn_by_headers() { return 1; }; cmd_check --domain plain.example 2>&1)
+ok "check：网站访问不了时，结论是“没法判断”" bash -c 'grep -q "^结论：没法判断。伪装域名 plain.example 没查成" <<< "$1"' _ "$out"
+out=$(cdn_by_headers() { return 2; }; cmd_check --domain plain.example 2>&1)
+ok "check：没装 curl 时，结论说明别的 CDN 没查" bash -c 'grep -q "^结论：没发现问题。" <<< "$1" && grep -q "^本机没装 curl，是不是走别的 CDN 没查" <<< "$1"' _ "$out"
 out=$(cmd_check --domain www.microsoft.com 2>&1); rc=$?
-ok "check：微软域名给出更换建议，退出码 0" bash -c '[[ $1 == 0 ]] && grep -q "建议（任选其一）" <<< "$2"' _ "$rc" "$out"
+ok "check：微软域名结论写“有风险”并给出怎么办，退出码 0" bash -c '[[ $1 == 0 ]] && grep -q "^结论：有风险。建议换掉伪装域名 www.microsoft.com" <<< "$2" && grep -q "^怎么办：" <<< "$2"' _ "$rc" "$out"
 out=$(cmd_check --domain www.cloudflare.com 2>&1); rc=$?
-ok "check：Cloudflare 退出码 2" eq "$rc" 2
+ok "check：Cloudflare 结论写“危险”，退出码 2" bash -c '[[ $1 == 2 ]] && grep -q "^结论：危险。伪装域名 www.cloudflare.com 走的是 Cloudflare" <<< "$2"' _ "$rc" "$out"
+out=$(cmd_check --domain www.cloudflare.com --domain www.apple.com 2>&1)
+ok "check：既有危险又有风险时，结论一起说" bash -c 'grep -q "^另外 www.apple.com 也有风险" <<< "$1"' _ "$out"
+out=$(cmd_check --domain nowhere.example 2>&1); rc=$?
+ok "check：只有解析不到的，结论写“没法判断”，不给换域名的建议" bash -c '[[ $1 == 0 ]] && grep -q "^结论：没法判断。" <<< "$2" && ! grep -q "怎么办" <<< "$2"' _ "$rc" "$out"
 out=$(cmd_check 2>&1)
 ok "check：没找到配置时说明“体检做完了”" bash -c 'grep -q "体检做完了：没在常见位置找到 REALITY 配置" <<< "$1"' _ "$out"
+# 真机上的样子：x-ui 数据库里 5 条、生成的 config.json 里 3 条，其实只有两个域名，每次解析出的 IP 都不一样
+mkdir -p "$WORK/x-ui/bin"
+xr() { printf '{\\"realitySettings\\": {\\"show\\": false, \\"target\\": \\"%s\\"}}\377\376' "$1"; }
+{ printf 'SQLite format 3\000'; xr www.ucla.edu:443; xr aws.amazon.com:443; xr www.ucla.edu:443; xr aws.amazon.com:443; xr aws.amazon.com:443; } > "$WORK/x-ui/x-ui.db"
+printf '{"inbounds":[{"streamSettings":{"realitySettings":{"target":"www.ucla.edu:443"}}},{"streamSettings":{"realitySettings":{"target":"aws.amazon.com:443"}}},{"streamSettings":{"realitySettings":{"target":"AWS.Amazon.com:8443"}}}]}' > "$WORK/x-ui/bin/config.json"
+XUI="$WORK/x-ui/x-ui.db $WORK/x-ui/bin/config.json"
+rot() { resolve_host() { local i; echo x >> "$WORK/lookups"; for i in 1 2 3 4 5 6; do echo "13.$((RANDOM % 250)).1.$i"; echo "2600:9000:$RANDOM::$i"; done; }
+        cdn_by_headers() { echo "亚马逊 CloudFront"; echo x >> "$WORK/curls"; }; "$@"; }
+: > "$WORK/curls"; : > "$WORK/lookups"
+out=$(FAKE_CONFIGS=$XUI rot cmd_check 2>&1); rc=$?
+ok "x-ui：两个域名只各出一行，域名不带端口" bash -c '[[ $(grep -c "^  \[有风险\] " <<< "$1") == 2 ]] && grep -q "^  \[有风险\] www.ucla.edu：看起来走 CDN（亚马逊 CloudFront）$" <<< "$1" && grep -q "^  \[有风险\] aws.amazon.com：" <<< "$1"' _ "$out"
+ok "x-ui：每个域名只解析一次、只访问一次" eq "$(wc -l < "$WORK/lookups" | tr -d ' ')/$(wc -l < "$WORK/curls" | tr -d ' ')" 2/2
+ok "x-ui：结论在列表前面，列出两个域名" bash -c '[[ $(grep -n "^结论：" <<< "$1" | cut -d: -f1) -lt $(grep -n "^  \[有风险\]" <<< "$1" | head -n 1 | cut -d: -f1) ]] && grep -q "^结论：有风险。建议换掉伪装域名 www.ucla.edu、aws.amazon.com，" <<< "$1"' _ "$out"
+ok "x-ui：默认不列 IP" bash -c '! grep -qE "13\.[0-9]+\.1\.|2600:9000" <<< "$1"' _ "$out"
+ok "x-ui：数据库和 config.json 都查了；两边都有的域名不加说明" bash -c 'grep -q "^查了这些配置：$2、$3$" <<< "$1" && ! grep -q "只在面板数据库里找到" <<< "$1"' _ "$out" "$WORK/x-ui/bin/config.json" "$WORK/x-ui/x-ui.db"
+ok "x-ui：退出码 0（有风险不算危险）" eq "$rc" 0
+ok "x-ui：输出里没有 target 和 IP 之外的术语轰炸（没有 ASN、limitFallback）" bash -c '! grep -qE "ASN|limitFallback" <<< "$1"' _ "$out"
+out=$(FAKE_CONFIGS=$XUI rot cmd_check -v 2>&1)
+ok "check -v：列出解析到的 IP 和出现在哪些配置里" bash -c 'grep -q "^      解析到：13\." <<< "$1" && grep -q "^      出现在：$2、$3$" <<< "$1"' _ "$out" "$WORK/x-ui/bin/config.json" "$WORK/x-ui/x-ui.db"
+ok "check -v：给出进阶建议和判断依据" bash -c 'grep -q "limitFallbackUpload" <<< "$1" && grep -q "^判断依据：" <<< "$1"' _ "$out"
+# 面板热更新入站时 config.json 可能还是旧的；数据库也可能扫到删掉的旧记录：只在数据库里的照样判断，加一句说明
+mkdir -p "$WORK/p2/x-ui/bin"; cp "$WORK/x-ui/bin/config.json" "$WORK/p2/x-ui/bin/config.json"
+{ cat "$WORK/x-ui/x-ui.db"; xr www.cloudflare.com:443; } > "$WORK/p2/x-ui/x-ui.db"
+out=$(FAKE_CONFIGS="$WORK/p2/x-ui/x-ui.db $WORK/p2/x-ui/bin/config.json" cmd_check 2>&1); rc=$?
+ok "x-ui：只在数据库里的危险域名照样报危险（退出码 2），并说明只在数据库里找到" bash -c '[[ $1 == 2 ]] && grep -q "^结论：危险。伪装域名 www.cloudflare.com" <<< "$2" && grep -q "^  \[危险\] www.cloudflare.com：.*（只在面板数据库里找到：面板里已经没有这个域名的话，是删掉的旧记录，不用管）$" <<< "$2" && ! grep -q "ucla.edu：.*只在面板数据库" <<< "$2"' _ "$rc" "$out"
+out=$(FAKE_CONFIGS="$WORK/p2/x-ui/x-ui.db" cmd_check 2>&1)
+ok "x-ui：没有 config.json 时照样查数据库，不加说明" bash -c 'grep -q "^  \[危险\] www.cloudflare.com：" <<< "$1" && ! grep -q "只在面板数据库里找到" <<< "$1"' _ "$out"
+out=$(cmd_check --file "$WORK/p2/x-ui/bin/config.json" --file "$WORK/p2/x-ui/x-ui.db" 2>&1)
+ok "check --file 同时指定 config.json 和数据库：两个都查" bash -c 'grep -q "^查了这些配置：$2、$3$" <<< "$1" && grep -q "www.cloudflare.com" <<< "$1"' _ "$out" "$WORK/p2/x-ui/bin/config.json" "$WORK/p2/x-ui/x-ui.db"
+out=$(FAKE_CONFIGS="$WORK/xray.json" cmd_check 2>&1)
+ok "check：本机回落显示原值、算没发现问题" bash -c 'grep -q "^  \[没发现问题\] 127.0.0.1:8001：回落到本机" <<< "$1"' _ "$out"
+out=$( CONF="$WORK/none.conf"; cmd_check --domain www.apple.com 2>&1 )
+ok "没装本工具时：不说“额度会兜底”，提示可以装" bash -c 'grep -q "可以装上本工具" <<< "$1" && ! grep -q "会兜底" <<< "$1"' _ "$out"
+out=$( CONF="$WORK/xray.json"; STATE="$WORK/none.state"; cmd_check --domain www.apple.com 2>&1 )
+ok "装了本工具时：说正常运行时每日额度会兜底，并提示用 status 确认" bash -c 'grep -q "本工具正常运行时，每日流量额度会兜底" <<< "$1" && grep -q "status 可以确认" <<< "$1"' _ "$out"
+echo 'PAUSED="1"' > "$WORK/paused.state"
+out=$( CONF="$WORK/xray.json"; STATE="$WORK/paused.state"; cmd_check --domain www.apple.com 2>&1 )
+ok "暂停中：不说会兜底，提示 resume" bash -c 'grep -q "暂停状态" <<< "$1" && ! grep -q "会兜底" <<< "$1"' _ "$out"
+printf 'PAUSED="0"\nSTATUS="error"\n' > "$WORK/error.state"
+out=$( CONF="$WORK/xray.json"; STATE="$WORK/error.state"; cmd_check --domain www.apple.com 2>&1 )
+ok "限速出错时（比如网卡上有别人的队列）：不说会兜底" bash -c 'grep -q "本工具现在没法限速" <<< "$1" && ! grep -q "会兜底" <<< "$1"' _ "$out"
 
 echo "## 配置解析"
 cat > "$WORK/evil.conf" <<EOF
@@ -406,7 +462,7 @@ ok "按面板校准：已用 300G" eq "$( ( load_all; billed ) )" $((300*G))
 # (900-300)/21 天（11-10 到 12-01）
 ok "今日额度 = 600G / 21 天" eq "$(st DAY_BUDGET)" $(( 600*G / 21 ))
 ok "安装输出包含状态" bash -c 'grep -q "今日额度" <<< "$1"' _ "$out"
-ok "安装最后顺便体检，结果在最后几行" bash -c 'grep -q "顺便做一次 REALITY 回落目标体检" <<< "$1" && tail -n 4 <<< "$1" | grep -q "体检做完了"' _ "$out"
+ok "--yes 安装：不做伪装域名体检，最后一行提示可以运行 check" bash -c '! grep -q "伪装域名体检（" <<< "$1" && tail -n 1 <<< "$1" | grep -q "运行：vps-traffic-guard check（只读）"' _ "$out"
 setroot eth0 "$OURS"; setroot eth1 "htb 1:"
 ( PATH="$WORK/shim:$PATH" cmd_uninstall --yes ) >/dev/null 2>&1
 
@@ -427,7 +483,7 @@ ok "交互安装：认得出网卡时不问网卡" bash -c '[[ -s $1 ]] && ! gre
 ok "交互安装：摘要里用大白话说明统计的网卡" bash -c 'grep -q "统计的网卡：eth0（VPS 连外网用的那块）" <<< "$1"' _ "$out"
 ok "交互安装：SSH 端口的问题说明已自动填好" grep -q "已自动填好你的 SSH 登录端口" "$WORK/asks"
 ok "交互安装：装好了，网卡是 eth0" grep -q 'IFACE="eth0"' "$VTG_CONF"
-ok "交互安装：最后输出的是体检结果" bash -c 'tail -n 4 <<< "$1" | grep -q "体检做完了"' _ "$out"
+ok "交互安装：最后问要不要做伪装域名体检，默认不做" bash -c 'tail -n 1 "$1" | grep -q "^ASK:要不要顺便检查伪装域名" && tail -n 1 <<< "$2" | grep -q "^跳过。以后想查，运行：vps-traffic-guard check" && ! grep -q "伪装域名体检（" <<< "$2"' _ "$WORK/asks" "$out"
 ( PATH="$WORK/shim:$PATH" cmd_uninstall --yes ) >/dev/null 2>&1
 fresh; rm -f "$VTG_CONF"; at "2026-11-10 12:00"; cnt $((3*G)) $((3*G))
 out=$(detect_iface() { :; }; iinstall 1000 1 both 300 eth0 22 Y)
@@ -443,11 +499,11 @@ ok "虚拟网卡：按回答的网卡装好" grep -q 'IFACE="eth0"' "$VTG_CONF"
 rm -rf "$VTG_SYS_NET/wg0"
 echo "www.cf-site.example 104.16.1.1" >> "$FAKE_DNS"
 fresh; rm -f "$VTG_CONF"; at "2026-11-10 12:00"; cnt $((3*G)) $((3*G))
-out=$(FAKE_CONFIGS="$WORK/xray.json" PATH="$WORK/shim:$PATH" cmd_install --quota 1000 --reset-day 1 --used 300 --exempt-ports 22 --yes </dev/null 2>&1); rc=$?
-ok "安装时体检发现危险：安装照样成功，危险显示在输出里" bash -c '[[ $1 == 0 && -x $3 ]] && grep -q "\[危险\] Xray target = www.cf-site.example:443" <<< "$2"' _ "$rc" "$out" "$VTG_BIN"
+out=$(FAKE_CONFIGS="$WORK/xray.json" iinstall 1000 1 both 300 22 Y y); rc=$?
+ok "交互安装选了体检、发现危险：安装照样成功，结论显示在最后" bash -c '[[ $1 == 0 && -x $3 ]] && grep -q "^结论：危险。伪装域名 www.cf-site.example 走的是 Cloudflare" <<< "$2"' _ "$rc" "$out" "$VTG_BIN"
 if command -v flock >/dev/null 2>&1; then   # Git Bash 没有 flock，这项只在 Linux 上跑
   out=$( cmd_check() { if ( exec 8>"$VTG_LOCK"; flock -n 8 ); then echo LOCK_FREE; else echo LOCK_HELD; fi; }
-         PATH="$WORK/shim:$PATH" cmd_install --quota 1000 --reset-day 1 --used 300 --exempt-ports 22 --yes </dev/null 2>&1 )
+         iinstall 1000 1 both 300 22 Y y )
   ok "体检前放开了锁（不挡每分钟的统计）" bash -c 'grep -q LOCK_FREE <<< "$1"' _ "$out"
 fi
 ( PATH="$WORK/shim:$PATH" cmd_uninstall --yes ) >/dev/null 2>&1
@@ -592,9 +648,7 @@ ok "直接回车 = 不关" eq "$(fwcalls)" ""
 
 echo "## 关端口：--yes --close-ports 先试用，确认后才保存"
 out=$(FAKE_NFT_HITS=7 install_base --close-ports)
-ok "--close-ports：体检只做一次，且在关端口之前（不占 180 秒确认时间）" bash -c '
-  a=$(grep -n "顺便做一次 REALITY" <<< "$1" | cut -d: -f1); b=$(grep -n "180 秒内运行" <<< "$1" | head -n 1 | cut -d: -f1)
-  [[ $a =~ ^[0-9]+$ && -n $b ]] && (( a < b ))' _ "$out"
+ok "--yes --close-ports：不做伪装域名体检" bash -c '! grep -q "伪装域名体检（" <<< "$1"' _ "$out"
 ok "先设置了 180 秒自动撤销保险" grep -q -- "--on-active=180 --timer-property=AccuracySec=1s --unit=vtg-ports-rescue" "$WORK/systemd-run.log"
 ok "保险只删本工具的表和链，再按已确认的列表恢复" bash -c 'grep -q "nft delete table inet vps_traffic_guard" "$1" && grep -q "ports restore" "$1" && ! grep -q flush "$1"' _ "$WORK/systemd-run.log"
 ok "nft 先预检、后生效" eq "$(fwcalls | grep -E '^nft -(c -)?f -$' | tr '\n' ';')" "nft -c -f -;nft -f -;"

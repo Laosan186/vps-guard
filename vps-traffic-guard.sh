@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # vps-traffic-guard: traffic guard for self-hosted proxy VPS
 #
-#   check    检查 Xray / sing-box 的 REALITY 回落目标（target/dest）是否指向 Cloudflare 等 CDN，或微软、苹果的域名。
+#   check    伪装域名体检：检查 Xray / sing-box 的 REALITY 回落目标（target/dest）是否指向 Cloudflare 等 CDN，或微软、苹果的域名。
 #            指向 CDN 时，鉴权失败的连接会被原样转发过去，VPS 可能被人当成中转偷跑流量。
 #   install  每天发一份流量额度（剩余流量 ÷ 账期剩余天数），额度内满速；
 #            当天用完就限速，次日 0 点自动恢复。SSH 端口永不限速。
@@ -13,7 +13,7 @@
 
 set -uo pipefail
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 APP="vps-traffic-guard"
 
 CONF="${VTG_CONF:-/etc/$APP.conf}"
@@ -583,12 +583,6 @@ iface_looks_virtual() { # 默认路由走 WARP / WireGuard / 隧道 / 容器网�
   return 1
 }
 
-install_check() { # 安装时顺便体检（只读，结果不影响安装）
-  echo
-  echo "顺便做一次 REALITY 回落目标体检（只读，不改任何东西；以后改了配置可以再运行 $APP check）："
-  cmd_check || true
-}
-
 detect_iface() {
   local i
   i=$(ip -4 route show default 2>/dev/null | awk '{ for (n = 1; n < NF; n++) if ($n == "dev") { print $(n + 1); exit } }')
@@ -774,8 +768,6 @@ cmd_install() {
     [[ $yn == [Yy]* ]] || { echo "已取消，未做任何改动。"; exit 0; }
   fi
   QUIET_EVENTS=0
-  # --yes --close-ports：关端口后的确认窗口从规则生效时就开始计时，体检要先做，别占用那段时间
-  (( !interactive && o_close )) && install_check
 
   # 正式写入：先拿锁，再从磁盘重新读状态，避免和定时任务互相覆盖
   take_lock
@@ -807,10 +799,19 @@ cmd_install() {
   print_status
   echo
   echo "已安装。每分钟自动统计一次。常用命令：$APP status / $APP check / $APP help"
-  # 最后顺便体检（只读）。要解析、访问目标网站，可能要等几秒：先放开锁，别让每分钟的统计等它；结果不影响安装
-  if (( interactive || !o_close )); then
-    exec 9>&-
-    install_check
+  # 伪装域名体检是可选的，默认不做。先放开锁：等用户回答、做体检时都别挡住每分钟的统计
+  exec 9>&-
+  echo
+  if (( interactive )); then
+    ask yn "要不要顺便检查伪装域名（REALITY 的 target）有没有被人借道偷流量的风险？（只读，不改任何东西；输入 y 检查，直接回车跳过）" "N"
+    if [[ $yn == [Yy]* ]]; then
+      echo
+      cmd_check || true   # 结果只是建议，不影响安装
+    else
+      echo "跳过。以后想查，运行：$APP check"
+    fi
+  else
+    echo "想检查伪装域名（REALITY 的 target）有没有被人借道偷流量的风险，运行：$APP check（只读）"
   fi
 }
 
@@ -1508,16 +1509,17 @@ resolve_host() {
   fi
 }
 
-cdn_by_headers() {
-  command -v curl >/dev/null 2>&1 || return 0
+cdn_by_headers() { # 主机 -> 看起来是哪家 CDN（看不出就不输出）。没访问成功返回 1，没装 curl 返回 2
+  command -v curl >/dev/null 2>&1 || return 2
   local h
   h=$(curl -sSI -m 8 -A 'Mozilla/5.0' "https://$1/" 2>/dev/null | tr 'A-Z' 'a-z')
+  [[ -n $h ]] || return 1
   case $h in
     *"server: cloudflare"*|*"cf-ray:"*)  echo "Cloudflare" ;;
-    *"x-amz-cf-id:"*|*cloudfront*)        echo "Amazon CloudFront" ;;
+    *"x-amz-cf-id:"*|*cloudfront*)        echo "亚马逊 CloudFront" ;;
     *"x-served-by: cache-"*|*fastly*)     echo "Fastly" ;;
     *akamai*)                             echo "Akamai" ;;
-    *"x-azure-ref:"*)                     echo "Azure Front Door" ;;
+    *"x-azure-ref:"*)                     echo "微软 Azure Front Door" ;;
   esac
 }
 
@@ -1544,22 +1546,24 @@ config_candidates() {
 }
 
 extract_targets() { # 文件 -> 每行 "类型<TAB>值"
-  local flat seg re_t re_d re_s
+  # x-ui.db 是 SQLite 二进制文件：按字节处理，否则 UTF-8 环境下 awk 会报 Invalid multibyte data
+  local LC_ALL=C flat seg re_t re_d re_s
   re_t='"target"[[:space:]]*:[[:space:]]*"([^"]+)"'
   re_d='"dest"[[:space:]]*:[[:space:]]*"([^"]+)"'
   re_s='"handshake"[[:space:]]*:[[:space:]]*\{[^}]*"server"[[:space:]]*:[[:space:]]*"([^"]+)"'
-  flat=$(tr -d '\000\r\n\\' < "$1" 2>/dev/null)
+  flat=$(LC_ALL=C tr -d '\000\r\n\\' < "$1" 2>/dev/null)
   while IFS= read -r seg; do
     if [[ $seg =~ $re_t ]]; then printf 'xray\t%s\n' "${BASH_REMATCH[1]}"
     elif [[ $seg =~ $re_d ]]; then printf 'xray\t%s\n' "${BASH_REMATCH[1]}"; fi
-  done < <(printf '%s' "$flat" | awk 'BEGIN { RS = "\"realitySettings\"" } NR > 1 { print substr($0, 1, 4000) }')
+  done < <(printf '%s' "$flat" | LC_ALL=C awk 'BEGIN { RS = "\"realitySettings\"" } NR > 1 { print substr($0, 1, 4000) }')
   while IFS= read -r seg; do
     if [[ $seg =~ $re_s ]]; then printf 'singbox\t%s\n' "${BASH_REMATCH[1]}"; fi
-  done < <(printf '%s' "$flat" | awk 'BEGIN { RS = "\"reality\"" } NR > 1 { print substr($0, 1, 4000) }')
+  done < <(printf '%s' "$flat" | LC_ALL=C awk 'BEGIN { RS = "\"reality\"" } NR > 1 { print substr($0, 1, 4000) }')
 }
 
-CHECK_BAD=0
-CHECK_WARN=0
+CHECK_BAD=0      # 危险：走 Cloudflare
+CHECK_WARN=0     # 有风险：看起来走别的 CDN，或是微软、苹果的网站
+CHECK_UNKNOWN=0  # 没法判断：解析不到 IP
 
 target_brand() { # 主机名 -> 微软 / 苹果 / Cloudflare；按名单，只认完整的一段段域名（notmicrosoft.com 不算）
   local h=${1,,} d
@@ -1576,64 +1580,72 @@ target_brand() { # 主机名 -> 微软 / 苹果 / Cloudflare；按名单，只�
   return 1
 }
 
-brand_verdict() { # 标签 值 IP 品牌 主机
-  local cdn
-  if [[ $4 == Cloudflare ]]; then
-    echo "  [危险] $1 = $2 → $3"
-    echo "         这是 Cloudflare 的域名，回落过去就等于给 Cloudflare 开了端口转发：鉴权失败的连接都会被转发到它那里。"
-    CHECK_BAD=$((CHECK_BAD + 1)); return
-  fi
-  echo "  [建议更换] $1 = $2 → $3"
-  echo "         这是$4的域名。微软、苹果的网站常被教程和一键脚本当作默认 target，大公司的站点也常用 CDN 分发："
-  echo "         鉴权失败的连接被转发过去，你的 VPS 可能被人当中转偷流量；用的人多，也更容易被一起识别。"
-  cdn=$(cdn_by_headers "$5")
-  [[ -n $cdn ]] && echo "         响应头像是 $cdn 的 CDN。"
-  CHECK_WARN=$((CHECK_WARN + 1))
-}
-
-check_one() { # 类型 值
-  local kind=$1 val=$2 label host ips ip cf=0 cdn brand=""
-  case $kind in
-    xray)    label="Xray target" ;;
-    singbox) label="sing-box handshake.server" ;;
-    *)       label="指定目标" ;;
-  esac
+# 判断一个回落目标。结果放进 CK_LEVEL（bad 危险 / risk 有风险 / unknown 没法判断 / ok 没问题）、CK_WHY（一句大白话）、CK_IPS
+check_one() { # 值
+  local val=$1 host ip cf=0 cdn="" brand="" is_ip=0 fetch=0
+  CK_LEVEL=ok CK_WHY="" CK_IPS="" CK_PARTIAL=0
   host=$(parse_target_host "$val")
   if is_local_host "$host"; then
-    echo "  [正常] $label = $val：回落到本机（自建站点/偷自己），不会把流量转给 CDN"
+    CK_WHY="回落到本机（自建网站 / 偷自己），不会被别人借道"
     return
   fi
-  if [[ $host =~ ^[0-9.]+$ || $host == *:* ]]; then ips=$host; else ips=$(resolve_host "$host" | tr '\n' ' '); brand=$(target_brand "$host"); fi
-  ips=${ips% }
-  if [[ -z ${ips// /} ]]; then
-    if [[ -n $brand ]]; then brand_verdict "$label" "$val" "（解析不到 IP）" "$brand" "$host"; return; fi
-    echo "  [未知] $label = $val：解析不到 IP，没法判断"
-    CHECK_WARN=$((CHECK_WARN + 1)); return
+  if [[ $host =~ ^[0-9.]+$ || $host == *:* ]]; then
+    is_ip=1; CK_IPS=$host
+  else
+    CK_IPS=$(resolve_host "$host" | tr '\n' ' '); CK_IPS=${CK_IPS% }
+    brand=$(target_brand "$host")
   fi
-  for ip in $ips; do is_cf_ip "$ip" && cf=1; done
-  if (( cf )); then
-    echo "  [危险] $label = $val → $ips"
-    echo "         属于 Cloudflare 网段：鉴权失败的连接会被转发到 Cloudflare，你的 VPS 等于给它开了端口转发。"
-    CHECK_BAD=$((CHECK_BAD + 1)); return
+  if [[ -z ${CK_IPS// /} ]]; then
+    CK_IPS=""
+    case $brand in
+      Cloudflare) CK_LEVEL=bad;     CK_WHY="Cloudflare 自己的网站（这次没解析到 IP，按域名就能确定）" ;;
+      "")         CK_LEVEL=unknown; CK_WHY="解析不到 IP，没法判断（域名可能写错了，或者 VPS 的 DNS 暂时有问题）" ;;
+      *)          CK_LEVEL=risk;    CK_WHY="${brand}的网站：很多教程拿它当默认值，用的人太多，容易被一起识别" ;;
+    esac
+    return
   fi
-  if [[ -n $brand ]]; then brand_verdict "$label" "$val" "$ips" "$brand" "$host"; return; fi
-  if [[ ! $host =~ ^[0-9.]+$ && $host != *:* ]]; then
-    cdn=$(cdn_by_headers "$host")
-    if [[ -n $cdn ]]; then
-      echo "  [注意] $label = $val → $ips"
-      echo "         响应头像是 $cdn 的 CDN。按 SNI 分流的共享 CDN 同样可能被当中转。"
-      CHECK_WARN=$((CHECK_WARN + 1)); return
-    fi
+  for ip in $CK_IPS; do is_cf_ip "$ip" && cf=1; done
+  if (( cf )); then CK_LEVEL=bad; CK_WHY="走 Cloudflare（解析到的 IP 在 Cloudflare 的网段里）"; return; fi
+  if [[ $brand == Cloudflare ]]; then CK_LEVEL=bad; CK_WHY="Cloudflare 自己的网站"; return; fi
+  if (( !is_ip )); then cdn=$(cdn_by_headers "$host"); fetch=$?; fi   # 0 访问成功 / 1 没访问成功 / 2 没装 curl
+  if [[ -n $brand ]]; then
+    CK_LEVEL=risk; CK_WHY="${brand}的网站：很多教程拿它当默认值，用的人太多，容易被一起识别"
+    [[ -n $cdn ]] && CK_WHY+="；看起来还走 CDN（$cdn）"
+    return
   fi
-  echo "  [正常] $label = $val → $ips：不在 Cloudflare 网段"
+  if [[ -n $cdn ]]; then CK_LEVEL=risk; CK_WHY="看起来走 CDN（$cdn）"; return; fi
+  if (( is_ip )); then
+    CK_WHY="不在 Cloudflare 的网段里"
+  elif (( fetch == 0 )); then
+    CK_WHY="没走 Cloudflare，也没看出走别的 CDN"
+  elif (( fetch == 2 )); then
+    CK_WHY="没走 Cloudflare；本机没装 curl，是不是走别的 CDN 没查"; CK_PARTIAL=1
+  else
+    # REALITY 要从这台 VPS 连到伪装域名；连不上时代理本身也用不了，不能算“没发现问题”
+    CK_LEVEL=unknown
+    CK_WHY="没走 Cloudflare，但从这台 VPS 用 HTTPS 访问不了它，看不出是不是走别的 CDN（伪装域名要能从 VPS 访问，REALITY 才能用）"
+  fi
 }
 
+check_key() { # 回落目标 -> 去重用的键：域名不分大小写、不带端口；本机回落按原值
+  local h
+  h=$(parse_target_host "$1")
+  if is_local_host "$h"; then echo "本机 $1"; return; fi
+  h=${h,,}
+  echo "${h%.}"
+}
+
+join_cn() { local out="" x; for x in "$@"; do out+="${out:+、}$x"; done; printf '%s' "$out"; }
+
 cmd_check() {
-  local files=() domains=() f d lines kind val found=0
+  local files=() domains=() f d kind val key name w verbose=0 got xui_cfg=0 partial=0 i
+  local -A where=() first=() not_db=()
+  local keys=() used=() bad=() risk=() unknown=() lv=() why=() ips=()
   while (( $# )); do
     case $1 in
+      -v|--verbose) verbose=1; shift; continue ;;
       --file|--domain) (( $# >= 2 )) || die "$1 后面需要一个值" ;;
-      *) die "未知参数：$1（用法：$APP check [--file 配置文件] [--domain 目标域名]）" ;;
+      *) die "未知参数：$1（用法：$APP check [-v] [--file 配置文件] [--domain 伪装域名]）" ;;
     esac
     if [[ $1 == --file ]]; then files+=("$2"); else domains+=("$2"); fi
     shift 2
@@ -1641,40 +1653,118 @@ cmd_check() {
   if (( ${#files[@]} == 0 && ${#domains[@]} == 0 )); then
     mapfile -t files < <(config_candidates | sort -u)
   fi
-  CHECK_BAD=0 CHECK_WARN=0
-  echo "== REALITY 回落目标体检 =="
+  CHECK_BAD=0 CHECK_WARN=0 CHECK_UNKNOWN=0
+  echo "== 伪装域名体检（REALITY 的回落目标 target / dest）=="
+
+  # 先收集、按域名去重：同一个域名常在多个配置、多个入站里重复出现。
+  # x-ui 面板的数据库和它生成的 config.json 都要看：面板可能不重启 xray、直接热更新入站，config.json 不一定是最新的；
+  # 数据库是按字节扫的，也可能扫到删掉的旧记录。所以只在数据库里出现的域名照样判断，只是加一句说明
   for f in ${files[@]+"${files[@]}"}; do
     [[ -r $f ]] || { warn "读不到 $f（需要 root？）"; continue; }
-    lines=$(extract_targets "$f")
-    [[ -n $lines ]] || continue
-    found=1
-    echo "配置：$f"
+    got=0
     while IFS=$'\t' read -r kind val; do
-      [[ -n $val ]] && check_one "$kind" "$val"
-    done <<< "$lines"
+      [[ -n $val ]] || continue
+      key=$(check_key "$val"); [[ -n $key ]] || continue
+      got=1
+      if [[ -z ${first[$key]+x} ]]; then first[$key]=$val; where[$key]=""; keys+=("$key"); fi
+      [[ $f == */x-ui.db ]] || not_db[$key]=1
+      [[ "、${where[$key]}、" == *"、$f、"* ]] || where[$key]+="${where[$key]:+、}$f"
+    done < <(extract_targets "$f")
+    if (( got )); then
+      used+=("$f")
+      [[ $f == */x-ui/bin/config.json ]] && xui_cfg=1
+    fi
   done
   for d in ${domains[@]+"${domains[@]}"}; do
-    found=1
-    check_one manual "$d"
+    key=$(check_key "$d"); [[ -n $key ]] || continue
+    if [[ -z ${first[$key]+x} ]]; then first[$key]=$d; where[$key]=""; keys+=("$key"); fi
+    not_db[$key]=1
+    [[ "、${where[$key]}、" == *"、手动指定、"* ]] || where[$key]+="${where[$key]:+、}手动指定"
   done
-  echo
-  if (( found == 0 )); then
+
+  if (( ${#keys[@]} == 0 )); then
     echo "体检做完了：没在常见位置找到 REALITY 配置，没有可查的。"
     echo "如果用了 REALITY、配置放在别处，可以手动指定："
-    echo "  $APP check --file /路径/config.json      或      $APP check --domain 你的target域名"
+    echo "  $APP check --file /路径/config.json      或      $APP check --domain 你的伪装域名"
     return 0
   fi
-  if (( CHECK_BAD > 0 || CHECK_WARN > 0 )); then
-    echo "建议（任选其一）："
-    echo "  1. 把 target 换成不走 CDN 的网站。Xray 官方文档的建议是选与 VPS 同一 ASN（同机房/同运营商）的网站。"
-    echo "  2. 用自己的域名在本机 Nginx 上建一个站，target 指向本机（俗称“偷自己”）。"
-    echo "  3. 确实要继续用，可在 realitySettings 里设置 limitFallbackUpload / limitFallbackDownload 限制回落流量。"
-    echo "     Xray 官方提醒：回落限速本身是一种特征，不建议默认启用，参数应随机化。"
-    echo "  改完重启 xray / sing-box，并同步修改客户端里的 SNI（serverName）。"
+  (( ${#used[@]} )) && echo "查了这些配置：$(join_cn "${used[@]}")"
+
+  # 每个域名只解析、访问一次
+  for key in "${keys[@]}"; do
+    if [[ $key == "本机 "* ]]; then name=${first[$key]}; else name=$key; fi
+    check_one "${first[$key]}"
+    (( CK_PARTIAL )) && partial=1
+    # 面板生成的 config.json 里没有、只在面板数据库里找到的
+    (( xui_cfg )) && [[ -z ${not_db[$key]+x} ]] && CK_WHY+="（只在面板数据库里找到：面板里已经没有这个域名的话，是删掉的旧记录，不用管）"
+    lv+=("$CK_LEVEL"); why+=("$CK_WHY"); ips+=("$CK_IPS")
+    case $CK_LEVEL in
+      bad)     CHECK_BAD=$((CHECK_BAD + 1)); bad+=("$name") ;;
+      risk)    CHECK_WARN=$((CHECK_WARN + 1)); risk+=("$name") ;;
+      unknown) CHECK_UNKNOWN=$((CHECK_UNKNOWN + 1)); unknown+=("$name") ;;
+    esac
+  done
+
+  echo
+  if (( CHECK_BAD )); then
+    echo "结论：危险。伪装域名 $(join_cn "${bad[@]}") 走的是 Cloudflare，别人可以借你的 VPS 中转、偷你的流量，建议尽快换掉。"
+    (( CHECK_WARN )) && echo "另外 $(join_cn "${risk[@]}") 也有风险，建议一起换掉。"
+  elif (( CHECK_WARN )); then
+    echo "结论：有风险。建议换掉伪装域名 $(join_cn "${risk[@]}")，别人可能借你的 VPS 偷流量。"
+  elif (( CHECK_UNKNOWN )); then
+    echo "结论：没法判断。伪装域名 $(join_cn "${unknown[@]}") 没查成（原因见下面）。请确认域名没写错，过一会儿再运行 $APP check。"
   else
-    echo "没有发现问题：回落目标不在 Cloudflare 网段，也不是微软、苹果的域名。"
+    echo "结论：没发现问题。查到的伪装域名没有走 Cloudflare，也没看出走别的 CDN。"
+    (( partial )) && echo "本机没装 curl，是不是走别的 CDN 没查（Cloudflare 照常查了）。装上 curl 再运行一次更准。"
   fi
-  echo "说明：Cloudflare 按官方公布的 IP 段比对，结论可靠；微软、苹果、Cloudflare 的域名按名单判断；其他 CDN 只按响应头推测，仅供参考。"
+  echo
+  for i in "${!keys[@]}"; do
+    key=${keys[$i]}
+    if [[ $key == "本机 "* ]]; then name=${first[$key]}; else name=$key; fi
+    case ${lv[$i]} in
+      bad) w="[危险]" ;; risk) w="[有风险]" ;; unknown) w="[没法判断]" ;; *) w="[没发现问题]" ;;
+    esac
+    echo "  $w $name：${why[$i]}"
+    if (( verbose )); then
+      [[ -n ${ips[$i]} ]] && echo "      解析到：${ips[$i]}"
+      [[ -n ${where[$key]} ]] && echo "      出现在：${where[$key]}"
+    fi
+  done
+
+  if (( CHECK_BAD || CHECK_WARN )); then
+    echo
+    echo "为什么：REALITY 会把没通过验证的连接原样转给伪装域名。伪装域名走 CDN 时，别人能把你的 VPS 当成去 CDN 的中转站，用掉的是你的流量。"
+    echo "怎么办："
+    echo "  1. 挑一个能用 HTTPS 打开、不走 CDN 的普通网站（最好和 VPS 在同一个国家或机房），"
+    echo "     先运行 $APP check --domain 新域名 看看，至少要显示“没发现问题”。"
+    echo "  2. 在面板的入站设置（REALITY 那一栏）或配置文件里，把 target（有的叫 dest）和 serverNames（SNI）都换成它。"
+    echo "  3. 保存后，客户端里的 SNI（serverName）也改成同一个域名。"
+    if [[ -f $CONF ]] && grep -q '^PAUSED="1"' "$STATE" 2>/dev/null; then
+      echo "  本工具的自动限速现在是暂停状态，被偷用不会限速；运行 $APP resume 可以恢复。"
+    elif [[ -f $CONF ]] && grep -q '^STATUS="error"' "$STATE" 2>/dev/null; then
+      echo "  注意：本工具现在没法限速（运行 $APP status 看原因），先别指望它兜底。"
+    elif [[ -f $CONF ]]; then
+      echo "  暂时不会改也别慌：本工具正常运行时，每日流量额度会兜底，当天额度用完就限速，不会一下子把整月流量跑光。"
+      echo "  （运行 $APP status 可以确认它在正常工作。）"
+    else
+      echo "  暂时不会改的话，可以装上本工具（$APP install），用每日流量额度兜底。"
+    fi
+  fi
+  if (( verbose )); then
+    if (( CHECK_BAD || CHECK_WARN )); then
+      echo
+      echo "进阶建议："
+      echo "  - Xray 官方文档建议选与 VPS 同一 ASN（同机房 / 同运营商）的网站当 target。"
+      echo "  - 用自己的域名在本机 Nginx 上建一个站，target 指向本机（俗称“偷自己”）。"
+      echo "  - 确实要继续用，可在 realitySettings 里设置 limitFallbackUpload / limitFallbackDownload 限制回落流量。"
+      echo "    Xray 官方提醒：回落限速本身是一种特征，不建议默认启用，参数应随机化。"
+      echo "  - 改完要重启 xray / sing-box（面板里保存后一般会自动重启）。"
+    fi
+    echo "判断依据：Cloudflare 按官方公布的 IP 段比对，结论可靠；微软、苹果、Cloudflare 的域名按名单判断；其他 CDN 只按响应头推测，仅供参考。"
+  else
+    echo
+    echo "想看解析到的 IP、每个域名出现在哪个配置里、判断依据和进阶建议：$APP check -v"
+  fi
   (( CHECK_BAD > 0 )) && return 2
   return 0
 }
@@ -1906,7 +1996,7 @@ $APP $VERSION：自建代理 VPS 的每日流量额度 + REALITY 回落目标体
 用法：
   bash $APP.sh install       安装（交互式填写套餐流量、重置日、计费方式）
   $APP status         查看本期用量、今日额度、是否在限速
-  $APP check          体检 REALITY 回落目标：是否指向 Cloudflare 等 CDN，或微软、苹果的域名
+  $APP check          伪装域名体检：REALITY 的 target 是否走 Cloudflare 等 CDN，或是微软、苹果的域名（-v 看详情）
   $APP set-used 123.4 按商家面板校准本期已用流量（GB）
   $APP pause | resume 暂停 / 恢复自动限速（暂停期间仍计数）
   $APP uninstall      卸载，并撤销本工具加的限速
