@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # vps-traffic-guard: traffic guard for self-hosted proxy VPS
 #
-#   check    检查 Xray / sing-box 的 REALITY 回落目标（target/dest）是否指向 Cloudflare 等 CDN。
+#   check    检查 Xray / sing-box 的 REALITY 回落目标（target/dest）是否指向 Cloudflare 等 CDN，或微软、苹果的域名。
 #            指向 CDN 时，鉴权失败的连接会被原样转发过去，VPS 可能被人当成中转偷跑流量。
 #   install  每天发一份流量额度（剩余流量 ÷ 账期剩余天数），额度内满速；
 #            当天用完就限速，次日 0 点自动恢复。SSH 端口永不限速。
@@ -13,7 +13,7 @@
 
 set -uo pipefail
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 APP="vps-traffic-guard"
 
 CONF="${VTG_CONF:-/etc/$APP.conf}"
@@ -574,6 +574,21 @@ cmd_pause_resume() { # 1=暂停 0=恢复
 
 # ---------------------------------------------------------------- 命令：install / uninstall
 
+stdin_is_tty() { [[ -t 0 ]]; }   # 单独成函数，测试里可以替换
+
+iface_looks_virtual() { # 默认路由走 WARP / WireGuard / 隧道 / 容器网桥时，按它统计流量多半不对
+  case ${1,,} in
+    wg*|warp*|cloudflarewarp*|tun*|tap*|tailscale*|zt*|docker*|br-*|veth*|virbr*|lo) return 0 ;;
+  esac
+  return 1
+}
+
+install_check() { # 安装时顺便体检（只读，结果不影响安装）
+  echo
+  echo "顺便做一次 REALITY 回落目标体检（只读，不改任何东西；以后改了配置可以再运行 $APP check）："
+  cmd_check || true
+}
+
 detect_iface() {
   local i
   i=$(ip -4 route show default 2>/dev/null | awk '{ for (n = 1; n < NF; n++) if ($n == "dev") { print $(n + 1); exit } }')
@@ -697,7 +712,7 @@ cmd_install() {
   [[ -n $o_thr ]] && THRESHOLD=$o_thr
   [[ -n $o_throttle ]] && THROTTLE_KBIT=$o_throttle
 
-  (( yes == 0 )) && [[ -t 0 ]] && interactive=1
+  (( yes == 0 )) && stdin_is_tty && interactive=1
   if (( interactive )); then
     echo "== 安装 $APP（直接回车 = 用方括号里的值）=="
     [[ -n $o_quota ]] || ask QUOTA_GB "套餐每月流量（GB）" "${QUOTA_GB:-1000}"
@@ -711,8 +726,21 @@ cmd_install() {
         ask o_used "本期商家面板显示已用多少 GB" "0"
       fi
     fi
-    [[ -n $o_iface ]] || ask IFACE "统计哪块网卡" "$IFACE"
-    [[ -n $o_ports ]] || ask EXEMPT_PORTS "永不限速的端口（SSH 端口，空格分隔）" "$EXEMPT_PORTS"
+    # 网卡按默认路由自动识别，新手不用懂这个词；认不出来、或认到的像是 WARP 这类虚拟网卡时才问
+    local why_ask=""
+    if [[ -z $o_iface ]]; then
+      if [[ -z $IFACE || ! -r $SYS_NET/$IFACE/statistics/rx_bytes ]]; then
+        why_ask="没能自动找到 VPS 连外网用的网卡（流量就是按它统计的）。"
+      elif iface_looks_virtual "$IFACE"; then
+        why_ask="自动找到的网卡是 $IFACE，看起来是 WARP、WireGuard 这类虚拟网卡，按它统计流量可能不准。"
+      fi
+    fi
+    if [[ -n $why_ask ]]; then
+      echo "$why_ask"
+      echo "运行 ip -br addr 可以查看：带公网 IP 的那一行，最前面的名字就是（常见 eth0、ens3）。"
+      ask IFACE "网卡名" "${IFACE:-eth0}"
+    fi
+    [[ -n $o_ports ]] || ask EXEMPT_PORTS "永不限速的端口（已自动填好你的 SSH 登录端口，一般直接回车）" "$EXEMPT_PORTS"
   else
     [[ -n $QUOTA_GB && -n $RESET_DAY ]] || die "非交互安装需要 --quota 和 --reset-day"
   fi
@@ -734,16 +762,20 @@ cmd_install() {
   b=$(billed); cap=$(throttle_cap_kbit)
   echo
   echo "将按以下设置运行："
-  echo "  网卡 $IFACE，$(mode_name "$COUNT_MODE")计费，套餐 ${QUOTA_GB} GB，每月 ${RESET_DAY} 号重置"
+  echo "  统计的网卡：$IFACE（VPS 连外网用的那块）"
+  echo "  $(mode_name "$COUNT_MODE")计费，套餐 ${QUOTA_GB} GB，每月 ${RESET_DAY} 号重置"
   echo "  本期 $(fmt_day "$CB_START") ~ $(fmt_day "$CB_NEXT")，已用 $(fmt_gb "$b")，用到 ${THRESHOLD}% 后不再发额度"
   echo "  今日额度约 $(fmt_gb "$(day_budget "$t" "$b")")；超额后限速不高于 ${cap} kbit/s（$(fmt_mbps "$cap")）"
   echo "  永不限速端口：$EXEMPT_PORTS（请确认包含你的 SSH 端口）"
   if (( interactive )); then
     local yn
+    echo "  哪一项不对就回答 n 取消，改好再运行（网卡可以加 --iface 网卡名 指定）。"
     ask yn "确认？" "Y"
     [[ $yn == [Yy]* ]] || { echo "已取消，未做任何改动。"; exit 0; }
   fi
   QUIET_EVENTS=0
+  # --yes --close-ports：关端口后的确认窗口从规则生效时就开始计时，体检要先做，别占用那段时间
+  (( !interactive && o_close )) && install_check
 
   # 正式写入：先拿锁，再从磁盘重新读状态，避免和定时任务互相覆盖
   take_lock
@@ -775,7 +807,11 @@ cmd_install() {
   print_status
   echo
   echo "已安装。每分钟自动统计一次。常用命令：$APP status / $APP check / $APP help"
-  echo "建议现在运行一次体检：$APP check"
+  # 最后顺便体检（只读）。要解析、访问目标网站，可能要等几秒：先放开锁，别让每分钟的统计等它；结果不影响安装
+  if (( interactive || !o_close )); then
+    exec 9>&-
+    install_check
+  fi
 }
 
 cmd_uninstall() {
@@ -1525,8 +1561,38 @@ extract_targets() { # 文件 -> 每行 "类型<TAB>值"
 CHECK_BAD=0
 CHECK_WARN=0
 
+target_brand() { # 主机名 -> 微软 / 苹果 / Cloudflare；按名单，只认完整的一段段域名（notmicrosoft.com 不算）
+  local h=${1,,} d
+  h=${h%.}
+  for d in microsoft.com bing.com live.com msn.com office.com windows.com xbox.com; do
+    [[ $h == "$d" || $h == *".$d" ]] && { echo 微软; return 0; }
+  done
+  for d in apple.com icloud.com apple.com.cn mzstatic.com itunes.com; do
+    [[ $h == "$d" || $h == *".$d" ]] && { echo 苹果; return 0; }
+  done
+  for d in cloudflare.com cloudflare.net cloudflare-dns.com; do
+    [[ $h == "$d" || $h == *".$d" ]] && { echo Cloudflare; return 0; }
+  done
+  return 1
+}
+
+brand_verdict() { # 标签 值 IP 品牌 主机
+  local cdn
+  if [[ $4 == Cloudflare ]]; then
+    echo "  [危险] $1 = $2 → $3"
+    echo "         这是 Cloudflare 的域名，回落过去就等于给 Cloudflare 开了端口转发：鉴权失败的连接都会被转发到它那里。"
+    CHECK_BAD=$((CHECK_BAD + 1)); return
+  fi
+  echo "  [建议更换] $1 = $2 → $3"
+  echo "         这是$4的域名。微软、苹果的网站常被教程和一键脚本当作默认 target，大公司的站点也常用 CDN 分发："
+  echo "         鉴权失败的连接被转发过去，你的 VPS 可能被人当中转偷流量；用的人多，也更容易被一起识别。"
+  cdn=$(cdn_by_headers "$5")
+  [[ -n $cdn ]] && echo "         响应头像是 $cdn 的 CDN。"
+  CHECK_WARN=$((CHECK_WARN + 1))
+}
+
 check_one() { # 类型 值
-  local kind=$1 val=$2 label host ips ip cf=0 cdn
+  local kind=$1 val=$2 label host ips ip cf=0 cdn brand=""
   case $kind in
     xray)    label="Xray target" ;;
     singbox) label="sing-box handshake.server" ;;
@@ -1537,9 +1603,10 @@ check_one() { # 类型 值
     echo "  [正常] $label = $val：回落到本机（自建站点/偷自己），不会把流量转给 CDN"
     return
   fi
-  if [[ $host =~ ^[0-9.]+$ || $host == *:* ]]; then ips=$host; else ips=$(resolve_host "$host" | tr '\n' ' '); fi
+  if [[ $host =~ ^[0-9.]+$ || $host == *:* ]]; then ips=$host; else ips=$(resolve_host "$host" | tr '\n' ' '); brand=$(target_brand "$host"); fi
   ips=${ips% }
   if [[ -z ${ips// /} ]]; then
+    if [[ -n $brand ]]; then brand_verdict "$label" "$val" "（解析不到 IP）" "$brand" "$host"; return; fi
     echo "  [未知] $label = $val：解析不到 IP，没法判断"
     CHECK_WARN=$((CHECK_WARN + 1)); return
   fi
@@ -1549,6 +1616,7 @@ check_one() { # 类型 值
     echo "         属于 Cloudflare 网段：鉴权失败的连接会被转发到 Cloudflare，你的 VPS 等于给它开了端口转发。"
     CHECK_BAD=$((CHECK_BAD + 1)); return
   fi
+  if [[ -n $brand ]]; then brand_verdict "$label" "$val" "$ips" "$brand" "$host"; return; fi
   if [[ ! $host =~ ^[0-9.]+$ && $host != *:* ]]; then
     cdn=$(cdn_by_headers "$host")
     if [[ -n $cdn ]]; then
@@ -1591,7 +1659,8 @@ cmd_check() {
   done
   echo
   if (( found == 0 )); then
-    echo "没在常见位置找到 REALITY 配置。可以手动指定："
+    echo "体检做完了：没在常见位置找到 REALITY 配置，没有可查的。"
+    echo "如果用了 REALITY、配置放在别处，可以手动指定："
     echo "  $APP check --file /路径/config.json      或      $APP check --domain 你的target域名"
     return 0
   fi
@@ -1603,9 +1672,9 @@ cmd_check() {
     echo "     Xray 官方提醒：回落限速本身是一种特征，不建议默认启用，参数应随机化。"
     echo "  改完重启 xray / sing-box，并同步修改客户端里的 SNI（serverName）。"
   else
-    echo "没有发现指向 Cloudflare 的回落目标。"
+    echo "没有发现问题：回落目标不在 Cloudflare 网段，也不是微软、苹果的域名。"
   fi
-  echo "说明：Cloudflare 按官方公布的 IP 段比对，结论可靠；其他 CDN 只按响应头推测，仅供参考。"
+  echo "说明：Cloudflare 按官方公布的 IP 段比对，结论可靠；微软、苹果、Cloudflare 的域名按名单判断；其他 CDN 只按响应头推测，仅供参考。"
   (( CHECK_BAD > 0 )) && return 2
   return 0
 }
@@ -1837,7 +1906,7 @@ $APP $VERSION：自建代理 VPS 的每日流量额度 + REALITY 回落目标体
 用法：
   bash $APP.sh install       安装（交互式填写套餐流量、重置日、计费方式）
   $APP status         查看本期用量、今日额度、是否在限速
-  $APP check          体检 REALITY 回落目标是否指向 Cloudflare 等 CDN
+  $APP check          体检 REALITY 回落目标：是否指向 Cloudflare 等 CDN，或微软、苹果的域名
   $APP set-used 123.4 按商家面板校准本期已用流量（GB）
   $APP pause | resume 暂停 / 恢复自动限速（暂停期间仍计数）
   $APP uninstall      卸载，并撤销本工具加的限速

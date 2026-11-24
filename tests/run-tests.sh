@@ -35,6 +35,11 @@ echo 0 > "$VTG_SYS_NET/eth1/statistics/rx_bytes"; echo 0 > "$VTG_SYS_NET/eth1/st
 # shellcheck source=../vps-traffic-guard.sh
 source "$SCRIPT"
 set +e
+# check 要解析域名、访问目标网站、扫描本机的 xray / sing-box 配置：离线测试里全换成假的
+FAKE_DNS="$WORK/dns"; : > "$FAKE_DNS"     # 每行：主机名 IP
+resolve_host() { awk -v h="$1" '$1 == h { print $2 }' "$FAKE_DNS"; }
+cdn_by_headers() { :; }
+config_candidates() { [[ -z ${FAKE_CONFIGS-} ]] || printf '%s\n' $FAKE_CONFIGS; }
 
 PASS=0 FAIL=0
 ok() { # 描述 命令...
@@ -154,6 +159,39 @@ CHECK_BAD=0; check_one xray "[2606:4700::1]:443" >/dev/null
 ok "check_one：CF IPv6 记为危险" eq "$CHECK_BAD" 1
 CHECK_BAD=0; check_one xray "127.0.0.1:8001" >/dev/null
 ok "check_one：本机回落不算危险" eq "$CHECK_BAD" 0
+
+echo "## 体检：微软、苹果、Cloudflare 的域名"
+printf '%s\n' "www.microsoft.com 23.40.1.1" "itunes.apple.com 17.253.1.1" "notmicrosoft.com 93.184.216.34" \
+  "microsoft.com.evil.net 93.184.216.35" "www.cloudflare.com 104.16.123.96" "plain.example 93.184.216.36" >> "$FAKE_DNS"
+cw() { CHECK_BAD=0 CHECK_WARN=0; check_one xray "$1" > "$WORK/cw.out"; echo "$CHECK_BAD/$CHECK_WARN"; }
+ok "微软域名：建议更换（记为注意，不算危险）" eq "$(cw www.microsoft.com:443)" "0/1"
+ok "微软域名：输出写明“建议更换”和是谁的域名" bash -c 'grep -q "\[建议更换\] Xray target = www.microsoft.com:443 → 23.40.1.1" "$1" && grep -q "这是微软的域名" "$1"' _ "$WORK/cw.out"
+ok "苹果域名（itunes.apple.com）：建议更换" eq "$(cw itunes.apple.com)" "0/1"
+ok "大写、末尾带点的苹果域名也认得" eq "$(cw WWW.Apple.Com.)" "0/1"
+r=$(cw www.bing.com)
+ok "解析不到 IP 的微软域名：仍然建议更换，不是“未知”" bash -c '[[ $2 == 0/1 ]] && grep -q "建议更换" "$1" && ! grep -q "\[未知\]" "$1"' _ "$WORK/cw.out" "$r"
+ok "notmicrosoft.com 不算微软" eq "$(cw notmicrosoft.com)" "0/0"
+ok "microsoft.com.evil.net 不算微软" eq "$(cw microsoft.com.evil.net)" "0/0"
+r=$(cw www.cloudflare.com)
+ok "Cloudflare 域名解析到 CF 网段：危险" bash -c '[[ $2 == 1/0 ]] && grep -q "属于 Cloudflare 网段" "$1"' _ "$WORK/cw.out" "$r"
+r=$(cw dash.cloudflare.com)
+ok "解析不到 IP 的 Cloudflare 域名：仍然危险" bash -c '[[ $2 == 1/0 ]] && grep -q "这是 Cloudflare 的域名" "$1"' _ "$WORK/cw.out" "$r"
+r=$(cw plain.example)
+ok "普通域名：正常" bash -c '[[ $2 == 0/0 ]] && grep -q "\[正常\]" "$1"' _ "$WORK/cw.out" "$r"
+r=$( cdn_by_headers() { echo Akamai; }; cw www.microsoft.com )
+ok "微软域名、响应头也像 CDN：一并说明，只记一次" bash -c '[[ $2 == 0/1 ]] && grep -q "响应头像是 Akamai 的 CDN" "$1"' _ "$WORK/cw.out" "$r"
+echo "myvm.eastus.cloudapp.azure.com 20.1.2.3" >> "$FAKE_DNS"
+ok "用户自己的 Azure 主机名不算微软" eq "$(cw myvm.eastus.cloudapp.azure.com)" "0/0"
+r=$(cw foo.workers.dev)
+ok "解析不到的 workers.dev 子域名：只是“未知”，不按品牌判" bash -c '[[ $2 == 0/1 ]] && grep -q "\[未知\]" "$1"' _ "$WORK/cw.out" "$r"
+out=$(cmd_check --domain plain.example 2>&1); rc=$?
+ok "check：没问题时说“没有发现问题”，退出码 0" bash -c '[[ $1 == 0 ]] && grep -q "没有发现问题" <<< "$2"' _ "$rc" "$out"
+out=$(cmd_check --domain www.microsoft.com 2>&1); rc=$?
+ok "check：微软域名给出更换建议，退出码 0" bash -c '[[ $1 == 0 ]] && grep -q "建议（任选其一）" <<< "$2"' _ "$rc" "$out"
+out=$(cmd_check --domain www.cloudflare.com 2>&1); rc=$?
+ok "check：Cloudflare 退出码 2" eq "$rc" 2
+out=$(cmd_check 2>&1)
+ok "check：没找到配置时说明“体检做完了”" bash -c 'grep -q "体检做完了：没在常见位置找到 REALITY 配置" <<< "$1"' _ "$out"
 
 echo "## 配置解析"
 cat > "$WORK/evil.conf" <<EOF
@@ -368,11 +406,51 @@ ok "按面板校准：已用 300G" eq "$( ( load_all; billed ) )" $((300*G))
 # (900-300)/21 天（11-10 到 12-01）
 ok "今日额度 = 600G / 21 天" eq "$(st DAY_BUDGET)" $(( 600*G / 21 ))
 ok "安装输出包含状态" bash -c 'grep -q "今日额度" <<< "$1"' _ "$out"
+ok "安装最后顺便体检，结果在最后几行" bash -c 'grep -q "顺便做一次 REALITY 回落目标体检" <<< "$1" && tail -n 4 <<< "$1" | grep -q "体检做完了"' _ "$out"
 setroot eth0 "$OURS"; setroot eth1 "htb 1:"
 ( PATH="$WORK/shim:$PATH" cmd_uninstall --yes ) >/dev/null 2>&1
+
 ok "卸载：删除程序、配置、状态、单元" bash -c "[[ ! -e '$VTG_BIN' && ! -e '$VTG_CONF' && ! -e '$VTG_STATE_DIR' && ! -e '$VTG_UNIT_DIR/vps-traffic-guard.timer' ]]"
 ok "卸载：撤掉本工具的限速" eq "$(root eth0)" "fq 0:"
 ok "卸载：不碰别人的 htb 1:" eq "$(root eth1)" "htb 1:"
+
+echo "## 交互安装：问什么、不问什么"
+iinstall() { # 答案...：假装在终端里安装，问过的问题记在 $WORK/asks
+  : > "$WORK/asks"
+  ( stdin_is_tty() { return 0; }
+    ask() { local __v=$1 __a=""; echo "ASK:$2" >> "$WORK/asks"; read -r __a || true; printf -v "$__v" '%s' "${__a:-$3}"; }
+    printf '%s\n' "$@" | SSH_CONNECTION="1.2.3.4 5555 10.0.0.2 22" PATH="$WORK/shim:$PATH" cmd_install ) 2>&1
+}
+fresh; rm -f "$VTG_CONF"; at "2026-11-10 12:00"; cnt $((3*G)) $((3*G))
+out=$(iinstall 1000 1 both 300 22 Y)
+ok "交互安装：认得出网卡时不问网卡" bash -c '[[ -s $1 ]] && ! grep -q "网卡" "$1"' _ "$WORK/asks"
+ok "交互安装：摘要里用大白话说明统计的网卡" bash -c 'grep -q "统计的网卡：eth0（VPS 连外网用的那块）" <<< "$1"' _ "$out"
+ok "交互安装：SSH 端口的问题说明已自动填好" grep -q "已自动填好你的 SSH 登录端口" "$WORK/asks"
+ok "交互安装：装好了，网卡是 eth0" grep -q 'IFACE="eth0"' "$VTG_CONF"
+ok "交互安装：最后输出的是体检结果" bash -c 'tail -n 4 <<< "$1" | grep -q "体检做完了"' _ "$out"
+( PATH="$WORK/shim:$PATH" cmd_uninstall --yes ) >/dev/null 2>&1
+fresh; rm -f "$VTG_CONF"; at "2026-11-10 12:00"; cnt $((3*G)) $((3*G))
+out=$(detect_iface() { :; }; iinstall 1000 1 both 300 eth0 22 Y)
+ok "认不出网卡时才问，并说明怎么查" bash -c 'grep -q "ASK:网卡名" "$1" && grep -q "没能自动找到 VPS 连外网用的网卡" <<< "$2"' _ "$WORK/asks" "$out"
+ok "认不出网卡时：按回答的网卡装好" grep -q 'IFACE="eth0"' "$VTG_CONF"
+( PATH="$WORK/shim:$PATH" cmd_uninstall --yes ) >/dev/null 2>&1
+mkdir -p "$VTG_SYS_NET/wg0/statistics"; echo 0 > "$VTG_SYS_NET/wg0/statistics/rx_bytes"; echo 0 > "$VTG_SYS_NET/wg0/statistics/tx_bytes"
+fresh; rm -f "$VTG_CONF"; at "2026-11-10 12:00"; cnt $((3*G)) $((3*G))
+out=$(detect_iface() { echo wg0; }; iinstall 1000 1 both 300 eth0 22 Y)
+ok "认到的是 wg0 这类虚拟网卡：也会问，并说明原因" bash -c 'grep -q "ASK:网卡名" "$1" && grep -q "看起来是 WARP、WireGuard" <<< "$2"' _ "$WORK/asks" "$out"
+ok "虚拟网卡：按回答的网卡装好" grep -q 'IFACE="eth0"' "$VTG_CONF"
+( PATH="$WORK/shim:$PATH" cmd_uninstall --yes ) >/dev/null 2>&1
+rm -rf "$VTG_SYS_NET/wg0"
+echo "www.cf-site.example 104.16.1.1" >> "$FAKE_DNS"
+fresh; rm -f "$VTG_CONF"; at "2026-11-10 12:00"; cnt $((3*G)) $((3*G))
+out=$(FAKE_CONFIGS="$WORK/xray.json" PATH="$WORK/shim:$PATH" cmd_install --quota 1000 --reset-day 1 --used 300 --exempt-ports 22 --yes </dev/null 2>&1); rc=$?
+ok "安装时体检发现危险：安装照样成功，危险显示在输出里" bash -c '[[ $1 == 0 && -x $3 ]] && grep -q "\[危险\] Xray target = www.cf-site.example:443" <<< "$2"' _ "$rc" "$out" "$VTG_BIN"
+if command -v flock >/dev/null 2>&1; then   # Git Bash 没有 flock，这项只在 Linux 上跑
+  out=$( cmd_check() { if ( exec 8>"$VTG_LOCK"; flock -n 8 ); then echo LOCK_FREE; else echo LOCK_HELD; fi; }
+         PATH="$WORK/shim:$PATH" cmd_install --quota 1000 --reset-day 1 --used 300 --exempt-ports 22 --yes </dev/null 2>&1 )
+  ok "体检前放开了锁（不挡每分钟的统计）" bash -c 'grep -q LOCK_FREE <<< "$1"' _ "$out"
+fi
+( PATH="$WORK/shim:$PATH" cmd_uninstall --yes ) >/dev/null 2>&1
 
 echo "## selftest（假 tc，不测速）"
 fresh
@@ -514,6 +592,9 @@ ok "直接回车 = 不关" eq "$(fwcalls)" ""
 
 echo "## 关端口：--yes --close-ports 先试用，确认后才保存"
 out=$(FAKE_NFT_HITS=7 install_base --close-ports)
+ok "--close-ports：体检只做一次，且在关端口之前（不占 180 秒确认时间）" bash -c '
+  a=$(grep -n "顺便做一次 REALITY" <<< "$1" | cut -d: -f1); b=$(grep -n "180 秒内运行" <<< "$1" | head -n 1 | cut -d: -f1)
+  [[ $a =~ ^[0-9]+$ && -n $b ]] && (( a < b ))' _ "$out"
 ok "先设置了 180 秒自动撤销保险" grep -q -- "--on-active=180 --timer-property=AccuracySec=1s --unit=vtg-ports-rescue" "$WORK/systemd-run.log"
 ok "保险只删本工具的表和链，再按已确认的列表恢复" bash -c 'grep -q "nft delete table inet vps_traffic_guard" "$1" && grep -q "ports restore" "$1" && ! grep -q flush "$1"' _ "$WORK/systemd-run.log"
 ok "nft 先预检、后生效" eq "$(fwcalls | grep -E '^nft -(c -)?f -$' | tr '\n' ';')" "nft -c -f -;nft -f -;"
