@@ -13,10 +13,18 @@
 用 root 登录 VPS，粘贴这一行，然后按提示填写套餐流量、重置日和面板上的已用量：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Laosan186/vps-guard/main/vps-traffic-guard.sh -o /usr/local/bin/vps-traffic-guard && bash /usr/local/bin/vps-traffic-guard install
+bash <(curl -fsSL https://laosan186.github.io/vps-guard/i)
 ```
 
 最后会问一句要不要顺便关掉用不到的端口，直接回车就是不关（见下文“关闭用不到的端口”）。
+
+- 这条命令运行的是仓库里的 [`i`](i)，四十行左右：把主脚本下载到 `/usr/local/bin/vps-traffic-guard`，检查下载完整（不完整就停下，不覆盖已装的版本），再运行安装。可以先打开看看再跑。
+- 以后更新到新版：再运行一次同一条命令，配置和计数会保留。不想回答问题就在末尾加 ` --yes`。
+- `github.io` 打不开时，改用 GitHub 原始地址：先下载到当前目录，再安装（安装时确认了才会复制到 `/usr/local/bin`）：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/Laosan186/vps-guard/main/vps-traffic-guard.sh && bash vps-traffic-guard.sh install
+```
 
 装完运行 `vps-traffic-guard check`，看看 REALITY 回落目标是否有问题。
 
@@ -178,7 +186,8 @@ vps-traffic-guard uninstall       # 卸载，并撤销限速和本工具关闭�
 - 同一台 VPS 上安装后：定时器每分钟运行；用 `set-used` 把本期已用调到触发线以上，会立即限速 403 kbit/s，与公式算出的一致，跨过定时器运行后仍保持；网卡上确实挂上 `htb 7e5d:`；改回真实用量后恢复满速，队列回到 `fq 0:`。
 - 跨过一个 0 点后：剩余天数从 19 变成 18，今日额度按公式重算（95.4 → 100.7 GB），状态文件里的计数和网卡实时计数一致。
 - **还没在真实 VPS 上验证的**：重启后续算、新账期切换。这些目前只有离线测试覆盖。
-- 关端口（0.2.0 新增）：离线测试共 236 项（含上面的部分），用假的 ss、nft、iptables / ip6tables、systemctl、systemd-run 驱动。覆盖：端口分类（认得出 / 认不出 / 多个程序共用 / 正有外网连接 / 只听本机 / SSH / 80、443）、不选关端口时一次都不调用防火墙命令、`--yes --close-ports` 试用与确认、交互 y / n / 超时 / 断线、超时自动撤销、试用中途重启后作废、手动指定在用端口被拒、ufw / firewalld 启用时跳过、nft 预检失败、iptables 后备、开机恢复、卸载只删本工具的规则。
+- 关端口（0.2.0 新增）：离线测试共 244 项（含上面的部分），用假的 ss、nft、iptables / ip6tables、systemctl、systemd-run 驱动。覆盖：端口分类（认得出 / 认不出 / 多个程序共用 / 正有外网连接 / 只听本机 / SSH / 80、443）、不选关端口时一次都不调用防火墙命令、`--yes --close-ports` 试用与确认、交互 y / n / 超时 / 断线、超时自动撤销、试用中途重启后作废、手动指定在用端口被拒、ufw / firewalld 启用时跳过、nft 预检失败、iptables 后备、开机恢复、卸载只删本工具的规则。
+- 短安装入口 `i`：离线测试覆盖正常安装和参数透传；下载到网页、截断的主脚本（包括截在两个函数之间、`bash -n` 照样能通过的那种）、下载失败时都会停下，不覆盖已装的版本；`i` 自己没收完整时什么都不执行。
 - 假 nft / iptables 不校验规则语法，所以关端口也在同一台真实 VPS 上测过（Ubuntu 22.04.5，KVM，内核 5.15，nftables 1.0.2，iptables 1.8.7 nf_tables 后端），38 项全部通过：
   - 用 `install --yes` 从 0.1.0 升级到 0.2.0，没选关端口时不碰防火墙。升级后状态里仍是原来的不限速端口和面板校准值（这一点是看状态输出确认的，没有单独断言）。
   - 扫描真实端口：SSH、网站、代理端口全部保留，没有建议关的。

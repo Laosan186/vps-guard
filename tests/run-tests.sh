@@ -700,6 +700,43 @@ ok "卸载：删掉端口文件和开机恢复单元" bash -c "[[ ! -e '$PF' && 
 ok "卸载：停用开机恢复、取消可能还在的保险" bash -c 'grep -q "vps-traffic-guard-ports.service" "$1" && grep -q "stop vtg-ports-rescue.timer" "$1"' _ "$WORK/systemctl.log"
 ok "卸载：只动过本工具的表，别人的 iptables 规则保留" bash -c '! grep -E "^nft (delete|flush)" "$1" | grep -qv "inet vps_traffic_guard" && [[ $(cat "$2") == "-p tcp --dport 8080 -j ACCEPT" ]]' _ "$FAKE_FW_DIR/calls.log" "$FAKE_FW_DIR/iptables.INPUT"
 
+# ---------------------------------------------------------------- 短安装入口 i（假 curl：按地址复制本地文件）
+echo "## 短安装入口 i"
+B="$WORK/boot"; mkdir -p "$B/fake" "$B/bin"
+cat > "$B/fake/curl" <<'EOF'
+#!/usr/bin/env bash
+out="" url=""
+while (( $# )); do case $1 in -o) out=$2; shift ;; -*) ;; *) url=$1 ;; esac; shift; done
+[[ -f $url ]] || exit 22
+cp "$url" "$out"
+EOF
+chmod +x "$B/fake/curl"
+printf '%s\n' '#!/usr/bin/env bash' 'VERSION="t"' 'main() { echo "RAN ARGS:$*"; }' \
+  'if [[ ${BASH_SOURCE[0]} == "$0" ]]; then' '  main "$@"' 'fi' > "$B/good.sh"
+printf '<html><body>blocked</body></html>\n' > "$B/html.sh"
+head -n "$(grep -n '^main() {' "$HERE/../vps-traffic-guard.sh" | cut -d: -f1)" "$HERE/../vps-traffic-guard.sh" | head -n -1 > "$B/cut.sh"
+boot() { # 下载源文件 [参数...]：用替身地址、临时安装路径、跳过 root 检查运行 i
+  local src=$1; shift
+  sed -e "s#local url=.*#local url=\"$B/$src\"#" -e "s#local bin=\"/usr/local/bin/vps-traffic-guard\" tmp#local bin=\"$B/bin/vtg\" tmp#" \
+      -e 's#^  \[\[ \$(id -u) == 0 \]\].*#  : 跳过 root 检查#' "$HERE/../i" > "$B/i.$src"
+  PATH="$B/fake:$PATH" bash "$B/i.$src" "$@" </dev/null 2>&1
+}
+ok "主脚本最后两行是 main 调用（i 靠它判断下载完整）" eq "$(tail -n 2 "$HERE/../vps-traffic-guard.sh")" $'  main "$@"\nfi'
+ok "截在函数之间的半截主脚本，bash -n 照样通过（所以 i 要另查结尾）" bash -n "$B/cut.sh"
+echo OLD > "$B/bin/vtg"
+out=$(boot good.sh --yes --quota 500); rc=$?
+ok "i：下载正常就安装，参数原样传给 install" bash -c '[[ $1 == 0 ]] && grep -q "RAN ARGS:install --yes --quota 500" <<< "$2" && [[ -x $3 ]] && cmp -s "$3" "$4"' _ "$rc" "$out" "$B/bin/vtg" "$B/good.sh"
+for bad in html.sh cut.sh missing.sh; do
+  echo OLD > "$B/bin/vtg"
+  out=$(boot "$bad"); rc=$?
+  ok "i：下载到 $bad 时停下，不覆盖已装的版本" bash -c '[[ $1 != 0 && $(cat "$2") == OLD ]] && ! grep -q "RAN ARGS" <<< "$3"' _ "$rc" "$B/bin/vtg" "$out"
+done
+for n in -1 25; do   # 只差最后一行 main "$@" / 截在函数中间（用跳过 root 检查的替身版，真执行了就会打印“正在下载”）
+  head -n "$n" "$B/i.good.sh" > "$B/i.half"
+  out=$(PATH="$B/fake:$PATH" bash "$B/i.half" </dev/null 2>&1)
+  ok "i 自己没收完整（head -n $n）：什么都不执行" bash -c '! grep -q "正在下载" <<< "$1" && [[ $(cat "$2") == OLD ]]' _ "$out" "$B/bin/vtg"
+done
+
 echo
 echo "通过 $PASS，失败 $FAIL"
 (( FAIL == 0 ))
